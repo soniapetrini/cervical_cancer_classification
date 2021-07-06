@@ -1,0 +1,1121 @@
+---
+title: "Cervical Cancer's Risk factors"
+author: "Sonia Petrini"
+date: "5/31/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(corrplot)
+library(car)
+library(leaps)
+library(vcd)
+library(ltm)
+library(parallel)
+library(mlr3)
+library(mlr3extralearners)
+library(mlr3tuning)
+library(paradox)
+```
+
+# Custom Functions
+
+```{r}
+equivalent <- function(x, y, tol = 0.01) abs(x - y) < tol
+
+optimal_threshold <-  function(learner,train_task,pred_task){
+thresholds <- seq(0.1,0.5,0.01)
+measures_list <- rep(list(list()), 3)
+learner$train(train_task)
+prediction <- learner$predict(pred_task) # predicting on train set
+
+for (thresh in thresholds) {
+    prediction$set_threshold(thresh)
+    #computing the scores
+    scores <- prediction$score(measures = c(msr("classif.acc"),msr("classif.sensitivity"),msr("classif.specificity")))
+    coefficients <- (unname(scores))
+    measures_list <- mapply(append, measures_list, coefficients, SIMPLIFY = FALSE)
+}
+measures <- data.frame(thresholds,
+                       "accuracy" = unlist(measures_list[[1]]), 
+                       "sensitivity" = unlist(measures_list[[2]]),
+                       "specificity" = unlist(measures_list[[3]]))
+
+
+#finding optimal point: intersection
+intersection_indices <- which(equivalent(measures$sensitivity,measures$specificity))
+th <- mean(thresholds[intersection_indices]) 
+
+melt_measures <- melt(measures, id.vars="thresholds")
+return(ggplot(melt_measures, aes( x=thresholds, y=value, colour=variable, group=variable )) + 
+  geom_line() +
+  geom_vline(xintercept = th,linetype = "dotted") +
+  geom_label(aes(x = 0.4, y = 0.5, label = as.character(mean(thresholds[intersection_indices]))))
+ )
+}
+
+```
+
+
+
+
+## Cervical cancer (Risk Factors) Data Set
+
+This dataset is structured in the following way:
+    * observations: 858 - patients subject to the study
+    * covariates: 32 - relevant information for diagnosing cervical cancer
+
+A peculiarity of this dataset is the presence of four possible target binary variables, all indicating the positive diagnosis of cervical cancer according to a specific test:
+    *Hinselmann: target variable
+    *Schiller: target variable
+    *Citology: target variable
+    *Biopsy: target variable
+    
+Since cervical cancer is very difficult to diagnose at an early stage, and the above mentioned tests are all costly and not easily accessible, the aim of this analysis will be to find which one allows to best predict the presence of cancer with the information provided by the reported variables.\
+In this way, we will facilitate the choice of the first test to be performed when cervical cancer is suspected, and the information stored in our variables are available for the patient.
+
+We will thus perform classification targeting each of these indices, and then compare their performances.
+
+As a technical note, the mlr3 framework will be used for many tasks. This package was created to collect all the machine learning tools available in R in a unified setting, and it provides many convenient devices to implement, evaluate, and visualize the analysis' process.
+
+___
+
+# Descriptive Statistics
+
+```{r}
+ccancer <- read.csv("risk_factors_cervical_cancer.csv")
+```
+
+## Explanatory Variables
+
+```{r}
+numeric <- Filter(is.numeric,ccancer)
+character <- Filter(is.character,ccancer)
+glimpse(numeric)
+glimpse(character)
+```
+
+After a first glimpse of the data we observe that even if many variables are stored as characters, they are actually numeric.\
+Moreover, there are many booleans, and variables with a very low number of unique values.
+We thus proceed with their re-encoding.
+
+```{r, message=F}
+# chr to num
+ccancer[,colnames(character)] <- lapply(ccancer[,colnames(character)], as.numeric)
+
+# num to factor
+unique_count <- sapply(ccancer, function(x) length(unique(x)))
+to_factorize <- data.frame(var = colnames(ccancer),unique_count) %>% dplyr::filter(unique_count <= 7) %>% arrange(unique_count)
+to_factorize
+```
+Notice that booleans will have 2 or 3 unique values, depending on the presence of NA values.\
+
+```{r}
+ccancer[,to_factorize$var] <- lapply(ccancer[,to_factorize$var], as.factor)
+```
+
+Now that all the variables have been assigned to the right type, we can summarize them in order to get a first understanding of their distribution, possible levels, and missing values.\
+
+
+## Variables summary
+
+```{r}
+summarytools::dfSummary(ccancer,graph.col = F,valid.col = F)
+```
+
+
+1. many missing values
+
+```{r}
+ccancer[,c("STDs..Time.since.first.diagnosis","STDs..Time.since.last.diagnosis")] <-  NULL
+```
+
+2. uninformative variables
+
+We remove STDs.cervical.condylomatosis and STDs.AIDS from our dataset, as we have seen from the summary that they only display one unique value, thus they are completely uninformative.
+```{r}
+ccancer[,c("STDs.cervical.condylomatosis", "STDs.AIDS")] <-  NULL
+```
+
+3. too few positives
+
+```{r}
+ccancer[,c("STDs.vaginal.condylomatosis", "STDs.pelvic.inflammatory.disease","STDs.genital.herpes",
+           "STDs.molluscum.contagiosum","STDs.Hepatitis.B","STDs.HPV")] <-  NULL
+```
+
+4. missing values
+
+fill with median for numerical, remove categorical
+
+```{r}
+ccancer$Age[is.na(ccancer$Age)] <- median(ccancer$Age, na.rm=TRUE)
+ccancer$Number.of.sexual.partners[is.na(ccancer$Number.of.sexual.partners)] <- median(ccancer$Number.of.sexual.partners, na.rm=TRUE)
+ccancer$First.sexual.intercourse [is.na(ccancer$First.sexual.intercourse )] <- median(ccancer$First.sexual.intercourse , na.rm=TRUE)
+ccancer$Num.of.pregnancies[is.na(ccancer$Num.of.pregnancies)] <- median(ccancer$Num.of.pregnancies, na.rm=TRUE)
+ccancer$Smokes..years.[is.na(ccancer$Smokes..years.)] <- median(ccancer$Smokes..years., na.rm=TRUE)
+ccancer$Smokes..packs.year.[is.na(ccancer$Smokes..packs.year.)] <- median(ccancer$Smokes..packs.year., na.rm=TRUE)
+ccancer$Hormonal.Contraceptives..years.[is.na(ccancer$Hormonal.Contraceptives..years.)] <- median(ccancer$Hormonal.Contraceptives..years., na.rm=TRUE)
+ccancer$IUD..years.[is.na(ccancer$IUD..years.)] <- median(ccancer$IUD..years., na.rm=TRUE)
+
+ccancer <- na.omit(ccancer)
+```
+
+
+## Correlation
+
+To compute the correlation among categorical variables in our dataset we use Cramer's V stat.\
+```{r}
+# define a custom wrapped function to get the whole matrix
+catcorrm <- function(vars, dat) sapply(vars, function(y) sapply(vars, function(x) assocstats(table(dat[,x], dat[,y]))$cramer))
+```
+
+And we plot the results in a correlation matrix.
+
+```{r}
+catcors <- catcorrm(colnames(Filter(is.factor,ccancer[,-c(23:26)])),ccancer)
+setEPS()
+postscript("cormat_cramer.eps",width = 7, height = 5)
+corrplot(catcors, method = "number", number.cex = 0.6, type = "lower", tl.cex = 0.6)
+dev.off()
+```
+
+
+Remove number of SDTs and number of STDs' diagnoses, as they are highly correlated with the more relevant actual STDs
+
+```{r}
+ccancer <- ccancer[,-c(13,18)]
+```
+
+```{r}
+rm(character,numeric,to_factorize)
+```
+
+
+### Visualization
+
+*binary*
+
+```{r}
+par(mfrow = c(2, 2))
+plot(xtabs(~Hinselmann+Smokes, data=ccancer),main = "Hinselmann",col=c("#66cc99","#ff6666"))
+plot(xtabs(~Schiller+Smokes, data=ccancer),main = "Schiller",col=c("#66cc99","#ff6666"))
+plot(xtabs(~Citology+Smokes, data=ccancer),main = "Citology",col=c("#66cc99","#ff6666"))
+plot(xtabs(~Biopsy+Smokes, data=ccancer),main = "Biopsy",col=c("#66cc99","#ff6666"))
+```
+
+```{r}
+setEPS()
+postscript("hormon_dummy.eps",width = 7, height = 4.5)
+par(mfrow = c(2, 2))
+plot(xtabs(~Hinselmann+Hormonal.Contraceptives, data=ccancer),main = "Hinselmann",col=c("#66cc99","#ff6666"))
+plot(xtabs(~Schiller+Hormonal.Contraceptives, data=ccancer),main = "Schiller",col=c("#66cc99","#ff6666"))
+plot(xtabs(~Citology+Hormonal.Contraceptives, data=ccancer),main = "Citology",col=c("#66cc99","#ff6666"))
+plot(xtabs(~Biopsy+Hormonal.Contraceptives, data=ccancer),main = "Biopsy",col=c("#66cc99","#ff6666"))
+dev.off()
+```
+
+
+*numerical.*
+
+
+
+```{r}
+
+mu_age_H <- ddply(ccancer, "Hinselmann", summarise, grp.mean=mean(Hormonal.Contraceptives..years.))
+mu_age_S <- ddply(ccancer, "Schiller", summarise, grp.mean=mean(Hormonal.Contraceptives..years.))
+mu_age_C <- ddply(ccancer, "Citology", summarise, grp.mean=mean(Hormonal.Contraceptives..years.))
+mu_age_B <- ddply(ccancer, "Biopsy", summarise, grp.mean=mean(Hormonal.Contraceptives..years.))
+
+# Change density plot line colors by groups
+H <- ggplot(ccancer, aes(x=Hormonal.Contraceptives..years., fill=Hinselmann)) +
+  geom_density() +
+  geom_vline(data=mu_age_H, aes(xintercept=grp.mean, color=Hinselmann),
+             linetype="dashed")
+
+S <- ggplot(ccancer, aes(x=Hormonal.Contraceptives..years., fill=Schiller)) +
+  geom_density() +
+  geom_vline(data=mu_age_S, aes(xintercept=grp.mean, color=Schiller),
+             linetype="dashed")
+
+C <- ggplot(ccancer, aes(x=Hormonal.Contraceptives..years., fill=Citology)) +
+  geom_density() +
+  geom_vline(data=mu_age_C, aes(xintercept=grp.mean, color=Citology),
+             linetype="dashed")
+
+B <- ggplot(ccancer, aes(x=Hormonal.Contraceptives..years., fill=Biopsy)) +
+  geom_density() +
+  geom_vline(data=mu_age_B, aes(xintercept=grp.mean, color=Biopsy),
+             linetype="dashed")
+
+setEPS()
+postscript("hormonal.eps",width = 7, height = 3.8)
+grid.arrange(H,S,C,B, ncol = 2, nrow = 2)
+dev.off()
+```
+
+
+
+
+
+___
+
+*STDs.condylomatosis*
+
+The general number of STDs doesn't seem to be consistently increasing the risk of being diagnosed with cervical cancer, so now proceed with visualizing the relation between the targets and the STD reporting the higher number of positive cases, which is condylomatosis.
+
+```{r}
+H_num <- ggplot(ccancer,
+       aes(x = factor(STDs.condylomatosis),fill = Hinselmann)) + 
+  geom_bar(position = "fill") +
+  labs(y = "Proportion", x = "condylomatosis") +
+  scale_fill_manual(values = c("green","red"))
+
+S_num <- ggplot(ccancer,
+       aes(x = factor(STDs.condylomatosis),fill = Schiller)) + 
+  geom_bar(position = "fill") +
+  labs(y = "Proportion", x = "condylomatosis") +
+  scale_fill_manual(values = c("green","red"))
+
+C_num <- ggplot(ccancer,
+       aes(x = factor(STDs.condylomatosis),fill = Citology)) + 
+  geom_bar(position = "fill") +
+  labs(y = "Proportion", x = "condylomatosis") +
+  scale_fill_manual(values = c("green","red"))
+
+B_num <- ggplot(ccancer,
+       aes(x = factor(STDs.condylomatosis),fill = Biopsy)) + 
+  geom_bar(position = "fill") +
+  labs(y = "Proportion", x = "condylomatosis") +
+  scale_fill_manual(values = c("green","red"))
+
+grid.arrange(H_num,S_num,C_num,B_num, ncol = 2)
+```
+Indeed, all the four tests show a higher proportion of positive cases among the patients diagnosed with condylomatosis.\
+In particular, the greatest difference is shown by Schiller's test.
+
+
+
+
+
+
+
+
+___
+
+## Target Variables and Balance
+
+Before performing our analysis, it is important to get an understanding of the balance between positives and negative cases for each of the four tests for cervical cancer.\
+
+```{r}
+TARGETS <- c("Hinselmann","Schiller","Citology","Biopsy")
+summarytools::dfSummary(ccancer[,TARGETS],graph.col = F,valid.col = F)
+```
+
+From the above summary table we can observe that the most "pessimistic" index, with 9.5 % of the cases labelled as positives, is *Schiller*.\
+The most "optimistic" one is instead *Hinselmann*, with only 4,5 % of detected positives.
+
+The dataset is very unbalanced with respect to all the targets.
+
+___
+
+◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊
+
+
+# HINSELMANN
+
+split into training and test
+
+```{r}
+set.seed(27)
+training_samples <- ccancer$Hinselmann %>% createDataPartition(p = 0.65, list = FALSE)
+train_H  <- ccancer[training_samples, -c(22:24)]
+test_H <- ccancer[-training_samples, -c(22:24)]
+```
+
+## SMOTE algorithm
+
+```{r}
+train_H_smoted <- SMOTE_NC(train_H, "Hinselmann", k = 10, perc_maj = 40)
+```
+
+obtained balanced training set
+
+```{r}
+summarytools::dfSummary(train_H_smoted[,"Hinselmann"],graph.col = F,valid.col = F)
+```
+
+define tasks
+
+```{r}
+task_train_H = TaskClassif$new("train_H", train_H_smoted, "Hinselmann",positive = "1")
+task_test_H = TaskClassif$new("test_H", test_H, "Hinselmann",positive = "1")
+```
+
+define learners
+
+```{r}
+# logistic regression
+learner_logreg = lrn("classif.log_reg", predict_type = "prob")
+# random forrest
+learner_rf = lrn("classif.ranger", predict_type = "prob")
+```
+
+
+# baseline logreg
+
+train performance
+
+```{r}
+
+optimal_threshold(learner_logreg, task_train_H, task_train_H)
+
+```
+
+```{r}
+learner_logreg$train(task_train_H)
+logreg_pred <- learner_logreg$predict(task_train_H) # predicting on test set
+logreg_pred$set_threshold(0.4)
+cm_logreg_train <- list("confusion" = logreg_pred$confusion,
+          "accuracy_train" = round(logreg_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_train"=round(logreg_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_train"=round(logreg_pred$score(measures = msr("classif.specificity")),3)
+          )
+cm_logreg_train
+```
+
+
+test performance
+
+```{r}
+setEPS()
+postscript("H_lr_test.eps",width = 7, height = 3)
+optimal_threshold(learner_logreg, task_train_H, task_test_H)
+dev.off()
+```
+
+```{r}
+learner_logreg$train(task_train_H)
+logreg_pred <- learner_logreg$predict(task_test_H) # predicting on test set
+logreg_pred$set_threshold(0.33)
+cm_logreg <- list("confusion" = logreg_pred$confusion,
+          "accuracy_test" = round(logreg_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_test"=round(logreg_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_test"=round(logreg_pred$score(measures = msr("classif.specificity")),3)
+          )
+cm_logreg
+```
+
+
+
+## Random forrest
+
+test performance
+
+```{r}
+optimal_threshold(learner_rf, task_train_H, task_test_H)
+```
+
+```{r}
+learner_rf$train(task_train_H)
+rf_pred <- learner_rf$predict(task_test_H) # predicting on test set
+rf_pred$set_threshold(0.107)
+# performance
+cm_rf <- list("confusion" = rf_pred$confusion,
+          "accuracy_test" = round(rf_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_test"=round(rf_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_test"=round(rf_pred$score(measures = msr("classif.specificity")),3))
+cm_rf
+```
+
+
+train performance
+
+```{r}
+setEPS()
+postscript("H_rf_train.eps",width = 7, height = 3)
+optimal_threshold(learner_rf, task_train_H, task_train_H)
+dev.off()
+```
+
+```{r}
+learner_rf$train(task_train_H)
+
+rf_pred <- learner_rf$predict(task_train_H) # predicting on test set
+
+rf_pred$set_threshold(0.33)
+
+# performance
+cm_rf_train <- list("confusion" = rf_pred$confusion,
+          "accuracy_train" = round(rf_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_train"=round(rf_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_train"=round(rf_pred$score(measures = msr("classif.specificity")),3))
+cm_rf_train
+```
+
+
+
+## Random Forrest optimization
+
+```{r, results='hide'}
+search_space = ps(
+  splitrule = p_fct(c("gini", "extratrees")),
+  importance = p_fct(c("none", "impurity", "impurity_corrected", "permutation")),
+  min.node.size = p_int(lower = 10, upper=30),
+  num.trees = p_int(lower = 500, upper=5000)
+  )
+
+CVstrat = rsmp("cv", folds = 5)
+measure = msr("classif.sensitivity")
+combo <- trm("combo",list(trm("evals", n_evals = 40),trm("stagnation")),any = TRUE)
+```
+
+
+```{r}
+# learner to optimize
+learner_rf_opt = lrn("classif.ranger", predict_type = "prob")
+
+instance = TuningInstanceSingleCrit$new(
+  task = task_train_H,
+  measure = measure,
+  learner = learner_rf_opt,
+  resampling = CVstrat,
+  search_space = search_space,
+  terminator = combo
+)
+instance
+```
+
+
+```{r}
+tuner = tnr("grid_search")
+future::plan(multicore=3) 
+tuner$optimize(instance)
+```
+
+# Optimized Random Forrest
+
+```{r}
+instance$result_learner_param_vals
+ #assigning optimized parameters
+learner_rf_opt$param_set$values = instance$result_learner_param_vals
+```
+
+test performance
+
+```{r}
+optimal_threshold(learner_rf_opt, task_train_H, task_test_H)
+```
+
+```{r}
+learner_rf_opt$train(task_train_H)
+
+base_pred <- learner_rf_opt$predict(task_test_H) # predicting on test set
+
+base_pred$set_threshold(0.115)
+
+# performance
+cm_rf_opt <- list("confusion" = base_pred$confusion,
+          "accuracy_test" = round(base_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_test"=round(base_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_test"=round(base_pred$score(measures = msr("classif.specificity")),3))
+cm_rf_opt
+```
+
+train performance
+
+```{r}
+optimal_threshold(learner_rf_opt, task_train_H, task_train_H)
+```
+
+```{r}
+learner_rf_opt$train(task_train_H)
+
+base_pred <- learner_rf_opt$predict(task_train_H) # predicting on train set
+
+base_pred$set_threshold(0.335)
+
+# performance
+cm_rf_opt_train <- list("confusion" = base_pred$confusion,
+          "accuracy_train" = round(base_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_train"=round(base_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_train"=round(base_pred$score(measures = msr("classif.specificity")),3))
+cm_rf_opt_train
+```
+
+
+
+
+
+
+
+
+
+
+
+◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊
+
+
+# SCHILLER
+
+split into training and test
+
+```{r}
+set.seed(27)
+training_samples <- ccancer$Schiller %>% createDataPartition(p = 0.65, list = FALSE)
+train_S  <- ccancer[training_samples, -c(21,23,24)]
+test_S <- ccancer[-training_samples, -c(21,23,24)]
+```
+
+## SMOTE algorithm
+
+```{r}
+train_S_smoted <- SMOTE_NC(train_S, "Schiller", k = 10, perc_maj = 30)
+```
+
+obtained balanced training set
+
+```{r}
+summarytools::dfSummary(train_S_smoted[,"Schiller"],graph.col = F,valid.col = F)
+```
+
+define tasks
+
+```{r}
+task_train_S = TaskClassif$new("train_S", train_S_smoted, "Schiller",positive = "1")
+task_test_S = TaskClassif$new("test_S", test_S, "Schiller",positive = "1")
+```
+
+## baseline logreg
+
+test performance
+
+```{r}
+optimal_threshold(learner_logreg,task_train_S,task_test_S)
+```
+
+```{r}
+learner_logreg$train(task_train_S)
+
+logreg_pred <- learner_logreg$predict(task_test_S) # predicting on test set
+
+logreg_pred$set_threshold(0.15)
+
+cm_logreg_test <- list("confusion" = logreg_pred$confusion,
+          "accuracy_test" = round(logreg_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_test"=round(logreg_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_test"=round(logreg_pred$score(measures = msr("classif.specificity")),3))
+cm_logreg_test
+```
+
+
+
+train performance
+
+```{r}
+optimal_threshold(learner_logreg,task_train_S,task_train_S)
+```
+
+```{r}
+learner_logreg$train(task_train_S)
+
+logreg_pred <- learner_logreg$predict(task_train_S) # predicting on test set
+
+logreg_pred$set_threshold(0.265)
+
+cm_logreg_train <- list("confusion" = logreg_pred$confusion,
+          "accuracy_train" = round(logreg_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_train"=round(logreg_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_train"=round(logreg_pred$score(measures = msr("classif.specificity")),3))
+cm_logreg_train
+```
+
+
+
+## random forrest
+
+test performance
+
+```{r}
+optimal_threshold(learner_rf,task_train_S,task_test_S)
+```
+
+
+```{r}
+learner_rf$train(task_train_S)
+rf_pred <- learner_rf$predict(task_test_S) # predicting on test set
+rf_pred$set_threshold(0.18)
+
+# performance
+cm_rf_test <- list("confusion" = rf_pred$confusion,
+          "accuracy_test" = round(rf_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_test"=round(rf_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_test"=round(rf_pred$score(measures = msr("classif.specificity")),3))
+cm_rf_test
+```
+
+train performance
+
+```{r}
+optimal_threshold(learner_rf,task_train_S,task_train_S)
+```
+
+
+```{r}
+learner_rf$train(task_train_S)
+rf_pred <- learner_rf$predict(task_train_S) # predicting on test set
+rf_pred$set_threshold(0.28)
+# performance
+cm_rf_train <- list("confusion" = rf_pred$confusion,
+          "accuracy_train" = round(rf_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_train"=round(rf_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_train"=round(rf_pred$score(measures = msr("classif.specificity")),3))
+cm_rf_train
+```
+
+
+
+# Random Forrest optimization
+
+```{r}
+learner_rf_opt = lrn("classif.ranger", predict_type = "prob")
+
+instance = TuningInstanceSingleCrit$new(
+  task = task_train_S,
+  measure = measure,
+  learner = learner_rf_opt,
+  resampling = CVstrat,
+  search_space = search_space,
+  terminator = combo
+)
+instance
+```
+
+```{r}
+tuner = tnr("grid_search")
+future::plan(multicore=3) 
+tuner$optimize(instance)
+```
+
+```{r}
+instance$result_learner_param_vals
+#assigning optimized parameters
+learner_rf_opt$param_set$values = instance$result_learner_param_vals
+```
+
+
+# optimized random forrest
+
+test performance
+
+```{r}
+optimal_threshold(learner_rf_opt,task_train_S,task_test_S)
+```
+
+```{r}
+learner_rf_opt$train(task_train_S)
+base_pred <- learner_rf_opt$predict(task_test_S) # predicting on test set
+base_pred$set_threshold(0.17)
+# performance
+cm_rf_test <- list("confusion" = base_pred$confusion,
+          "accuracy_test" = round(base_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_test"=round(base_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_test"=round(base_pred$score(measures = msr("classif.specificity")),3))
+cm_rf_test
+```
+
+
+
+```{r}
+optimal_threshold(learner_rf_opt,task_train_S,task_train_S)
+```
+
+```{r}
+base_pred <- learner_rf_opt$predict(task_train_S) # predicting on train set
+base_pred$set_threshold(0.275)
+# performance
+cm_rf_train <- list("confusion" = base_pred$confusion,
+          "accuracy_train" = round(base_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_train"=round(base_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_train"=round(base_pred$score(measures = msr("classif.specificity")),3))
+cm_rf_train
+```
+
+
+
+
+
+
+
+◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊
+
+# CITOLOGY
+
+split into training and test
+
+```{r}
+set.seed(27)
+training_samples <- ccancer$Citology %>% createDataPartition(p = 0.65, list = FALSE)
+train_C  <- ccancer[training_samples, -c(21,22,24)]
+test_C <- ccancer[-training_samples, -c(21,22,24)]
+```
+
+## SMOTE algorithm
+
+```{r}
+train_C_smoted <- SMOTE_NC(train_C, "Citology", k = 10, perc_maj = 50)
+```
+
+## define tasks
+
+```{r}
+task_train_C = TaskClassif$new("train_C", train_C_smoted, "Citology",positive = "1")
+task_test_C = TaskClassif$new("test_C", test_C, "Citology",positive = "1")
+```
+
+## baseline logreg
+
+```{r}
+optimal_threshold(learner_logreg,task_train_C,task_test_C)
+```
+
+
+test performance
+```{r}
+learner_logreg$train(task_train_C)
+logreg_pred <- learner_logreg$predict(task_test_C) # predicting on test set
+logreg_pred$set_threshold(0.28)
+cm_logreg_test <- list("confusion" = logreg_pred$confusion,
+          "accuracy_test" = round(logreg_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_test"=round(logreg_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_test"=round(logreg_pred$score(measures = msr("classif.specificity")),3))
+cm_logreg_test
+```
+
+
+
+train performance
+
+```{r}
+optimal_threshold(learner_logreg,task_train_C,task_train_C)
+```
+
+```{r}
+learner_logreg$train(task_train_C)
+
+logreg_pred <- learner_logreg$predict(task_train_C) # predicting on test set
+
+logreg_pred$set_threshold(0.375)
+
+cm_logreg_train <- list("confusion" = logreg_pred$confusion,
+          "accuracy_train" = round(logreg_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_train"=round(logreg_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_train"=round(logreg_pred$score(measures = msr("classif.specificity")),3))
+cm_logreg_train
+```
+
+
+## random forrest
+
+test performance
+
+```{r}
+optimal_threshold(learner_rf,task_train_C,task_test_C)
+```
+
+```{r}
+learner_rf$train(task_train_C)
+rf_pred <- learner_rf$predict(task_test_C) # predicting on test set
+rf_pred$set_threshold(0.17)
+# performance
+cm_rf_test <- list("confusion" = rf_pred$confusion,
+          "accuracy_test" = round(rf_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_test"=round(rf_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_test"=round(rf_pred$score(measures = msr("classif.specificity")),3))
+cm_rf_test
+```
+
+train performance
+
+```{r}
+optimal_threshold(learner_rf,task_train_C,task_train_C)
+```
+
+```{r}
+learner_rf$train(task_train_C)
+rf_pred <- learner_rf$predict(task_train_C) # predicting on test set
+rf_pred$set_threshold(0.36) # OPTIMIZED
+# performance
+cm_rf_train <- list("confusion" = rf_pred$confusion,
+          "accuracy_train" = round(rf_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_train"=round(rf_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_train"=round(rf_pred$score(measures = msr("classif.specificity")),3))
+cm_rf_train
+```
+
+
+
+# Random Forrest optimization
+
+```{r}
+learner_rf_opt = lrn("classif.ranger", predict_type = "prob")
+
+instance = TuningInstanceSingleCrit$new(
+  task = task_train_C,
+  measure = measure,
+  learner = learner_rf_opt,
+  resampling = CVstrat,
+  search_space = search_space,
+  terminator = combo
+)
+instance
+```
+
+```{r}
+tuner = tnr("random_search")
+future::plan(multicore=3) 
+tuner$optimize(instance)
+```
+
+```{r}
+instance$result_learner_param_vals
+#assigning optimized parameters
+learner_rf_opt$param_set$values = instance$result_learner_param_vals
+```
+
+
+# optimized random forrest
+
+test performance
+
+```{r}
+optimal_threshold(learner_rf_opt,task_train_C,task_test_C)
+```
+
+```{r}
+learner_rf_opt$train(task_train_C)
+
+base_pred <- learner_rf_opt$predict(task_test_C) # predicting on test set
+
+base_pred$set_threshold(0.187) # OPTIMIZED
+
+# performance
+cm_rf_opt_test <- list("confusion" = base_pred$confusion,
+          "accuracy_test" = round(base_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_test"=round(base_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_test"=round(base_pred$score(measures = msr("classif.specificity")),3))
+cm_rf_opt_test
+```
+
+
+
+train performance
+
+```{r}
+optimal_threshold(learner_rf_opt,task_train_C,task_train_C)
+```
+
+
+```{r}
+base_pred <- learner_rf_opt$predict(task_train_C) # predicting on train set
+base_pred$set_threshold(0.355) # OPTIMIZED
+
+# performance
+cm_rf_opt_train <- list("confusion" = base_pred$confusion,
+          "accuracy_train" = round(base_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_train"=round(base_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_train"=round(base_pred$score(measures = msr("classif.specificity")),3))
+cm_rf_opt_train
+```
+
+
+
+
+
+
+
+◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊◊
+
+# BIOPSY
+
+split into training and test
+
+```{r}
+set.seed(27)
+training_samples <- ccancer$Biopsy %>% createDataPartition(p = 0.65, list = FALSE)
+train_C  <- ccancer[training_samples, -c(21,22,23)]
+test_C <- ccancer[-training_samples, -c(21,22,23)]
+```
+
+## SMOTE algorithm
+
+```{r}
+train_C_smoted <- SMOTE_NC(train_C, "Biopsy", k = 10, perc_maj = 50)
+```
+
+## define tasks
+
+```{r}
+task_train_C = TaskClassif$new("train_C", train_C_smoted, "Biopsy",positive = "1")
+task_test_C = TaskClassif$new("test_C", test_C, "Biopsy",positive = "1")
+```
+
+
+## baseline logreg
+
+```{r}
+optimal_threshold(learner_logreg,task_train_C,task_test_C)
+```
+
+
+test performance
+```{r}
+learner_logreg$train(task_train_C)
+logreg_pred <- learner_logreg$predict(task_test_C) # predicting on test set
+logreg_pred$set_threshold(0.267)
+cm_logreg_test <- list("confusion" = logreg_pred$confusion,
+          "accuracy_test" = round(logreg_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_test"=round(logreg_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_test"=round(logreg_pred$score(measures = msr("classif.specificity")),3))
+cm_logreg_test
+```
+
+
+
+train performance
+
+```{r}
+optimal_threshold(learner_logreg,task_train_C,task_train_C)
+```
+
+```{r}
+learner_logreg$train(task_train_C)
+logreg_pred <- learner_logreg$predict(task_train_C) # predicting on test set
+logreg_pred$set_threshold(0.33)
+cm_logreg_train <- list("confusion" = logreg_pred$confusion,
+          "accuracy_train" = round(logreg_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_train"=round(logreg_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_train"=round(logreg_pred$score(measures = msr("classif.specificity")),3))
+cm_logreg_train
+```
+
+
+## random forrest
+
+test performance
+
+```{r}
+optimal_threshold(learner_rf,task_train_C,task_test_C)
+```
+
+```{r}
+rf_pred <- learner_rf$predict(task_test_C) # predicting on test set
+rf_pred$set_threshold(0.145)
+# performance
+cm_rf_test <- list("confusion" = rf_pred$confusion,
+          "accuracy_test" = round(rf_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_test"=round(rf_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_test"=round(rf_pred$score(measures = msr("classif.specificity")),3))
+cm_rf_test
+```
+
+train performance
+
+```{r}
+optimal_threshold(learner_rf,task_train_C,task_train_C)
+```
+
+```{r}
+rf_pred <- learner_rf$predict(task_train_C) # predicting on test set
+rf_pred$set_threshold(0.29) # OPTIMIZED
+# performance
+cm_rf_train <- list("confusion" = rf_pred$confusion,
+          "accuracy_train" = round(rf_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_train"=round(rf_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_train"=round(rf_pred$score(measures = msr("classif.specificity")),3))
+cm_rf_train
+```
+
+# Random Forrest optimization
+
+```{r}
+learner_rf_opt = lrn("classif.ranger", predict_type = "prob")
+instance = TuningInstanceSingleCrit$new(
+  task = task_train_C,
+  measure = measure,
+  learner = learner_rf_opt,
+  resampling = CVstrat,
+  search_space = search_space,
+  terminator = combo
+)
+instance
+```
+
+```{r}
+tuner = tnr("random_search")
+future::plan(multicore=3) 
+tuner$optimize(instance)
+```
+
+```{r}
+instance$result_learner_param_vals
+#assigning optimized parameters
+learner_rf_opt$param_set$values = instance$result_learner_param_vals
+```
+
+
+# optimized random forrest
+
+test performance
+
+```{r}
+optimal_threshold(learner_rf_opt,task_train_C,task_test_C)
+```
+
+```{r}
+learner_rf_opt$train(task_train_C)
+base_pred <- learner_rf_opt$predict(task_test_C) # predicting on test set
+base_pred$set_threshold(0.156) # OPTIMIZED
+# performance
+cm_rf_opt_test <- list("confusion" = base_pred$confusion,
+          "accuracy_test" = round(base_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_test"=round(base_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_test"=round(base_pred$score(measures = msr("classif.specificity")),3))
+cm_rf_opt_test
+```
+
+
+
+train performance
+
+```{r}
+optimal_threshold(learner_rf_opt,task_train_C,task_train_C)
+```
+
+
+```{r}
+base_pred <- learner_rf_opt$predict(task_train_C) # predicting on train set
+base_pred$set_threshold(0.3) # OPTIMIZED
+# performance
+cm_rf_opt_train <- list("confusion" = base_pred$confusion,
+          "accuracy_train" = round(base_pred$score(measures = msr("classif.acc")),3),
+          "sensitivity_train"=round(base_pred$score(measures = msr("classif.sensitivity")),3),
+          "specificity_train"=round(base_pred$score(measures = msr("classif.specificity")),3))
+cm_rf_opt_train
+```
+
+
+
+
+
+
+
+
+
+
+
